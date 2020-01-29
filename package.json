@@ -7,7 +7,10 @@
   "scripts": {
     "start": "node index.js"
   },
-  "author": "Ankur Oberoi <aoberoi@gmail.com>",
+  "engines": {
+    "node" : ">=6.11.3"
+  },
+  "author": "Bret McGowen",
   "license": "Apache-2.0",
   "dependencies": {
     "@aoberoi/passport-slack": "^1.0.5",
