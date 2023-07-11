@@ -14,7 +14,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@aoberoi/passport-slack": "^1.0.5",
-    "@slack/client": "^3.8.1",
+    "@slack/client": "^5.0.2",
     "@slack/events-api": "^1.0.0",
     "body-parser": "^1.16.1",
     "dotenv": "^4.0.0",
