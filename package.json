@@ -5,7 +5,8 @@
   "description": "A minimal multi-workspace Slack app built with Bolt for JavaScript: greets people who say hi and echoes reactions",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test/e2e.js"
   },
   "engines": {
     "node": ">=20"
