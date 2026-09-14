@@ -1,116 +1,146 @@
 // Load environment variables from `.env` file (optional)
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
-const slackEventsApi = require('@slack/events-api');
-const SlackClient = require('@slack/client').WebClient;
-const passport = require('passport');
-const SlackStrategy = require('@aoberoi/passport-slack').default.Strategy;
-const http = require('http');
-const express = require('express');
-const bodyParser = require('body-parser');
+const fs = require('fs');
+const path = require('path');
+const { App, LogLevel } = require('@slack/bolt');
 
-// *** Initialize event adapter using verification token from environment variables ***
-const slackEvents = slackEventsApi.createSlackEventAdapter(process.env.SLACK_VERIFICATION_TOKEN, {
-  includeBody: true
-});
-
-// Initialize a data structures to store team authorization info (typically stored in a database)
-const botAuthorizations = {}
-
-// Helpers to cache and lookup appropriate client
-// NOTE: Not enterprise-ready. if the event was triggered inside a shared channel, this lookup
-// could fail but there might be a suitable client from one of the other teams that is within that
-// shared channel.
-const clients = {};
-function getClientByTeamId(teamId) {
-  if (!clients[teamId] && botAuthorizations[teamId]) {
-    clients[teamId] = new SlackClient(botAuthorizations[teamId]);
-  }
-  if (clients[teamId]) {
-    return clients[teamId];
-  }
-  return null;
+// The OAuth `state` parameter is a JWT signed with this secret, issued on
+// /slack/install and verified on /slack/oauth_redirect. A per-process random
+// value would break any install that spans a restart or a second instance, so
+// require it rather than generating one.
+if (!process.env.SLACK_STATE_SECRET) {
+  throw new Error(
+    'SLACK_STATE_SECRET is required. Use any random string, and keep it stable across ' +
+    'restarts and across instances, or in-flight installs will fail with an opaque 400.'
+  );
 }
 
-// Initialize Add to Slack (OAuth) helpers
-passport.use(new SlackStrategy({
-  clientID: process.env.SLACK_CLIENT_ID,
-  clientSecret: process.env.SLACK_CLIENT_SECRET,
-  skipUserProfile: true,
-}, (accessToken, scopes, team, extra, profiles, done) => {
-  botAuthorizations[team.id] = extra.bot.accessToken;
-  done(null, {});
-}));
-
-// Initialize an Express application
-const app = express();
-app.use(bodyParser.json());
-
-// Plug the Add to Slack (OAuth) helpers into the express app
-app.use(passport.initialize());
-app.get('/', (req, res) => {
-  res.send('<a href="/auth/slack"><img alt="Add to Slack" height="40" width="139" src="https://platform.slack-edge.com/img/add_to_slack.png" srcset="https://platform.slack-edge.com/img/add_to_slack.png 1x, https://platform.slack-edge.com/img/add_to_slack@2x.png 2x" /></a>');
-});
-app.get('/auth/slack', passport.authenticate('slack', {
-  scope: ['bot']
-}));
-app.get('/auth/slack/callback',
-  passport.authenticate('slack', { session: false }),
-  (req, res) => {
-    res.sendFile('views/auth.html', {root: __dirname });
+// *** Installation store ***
+// Bolt calls this after each "Add to Slack" and before handling each event.
+// This in-memory version is fine for a demo; a real app would use a database.
+const installations = new Map();
+const installationStore = {
+  async storeInstallation(installation) {
+    installations.set(installationKey(installation), installation);
   },
-  (err, req, res, next) => {
-    res.status(500).send(`<p>Greet and React failed to install</p> <pre>${err}</pre>`);
-  }
-);
-
-// *** Plug the event adapter into the express app as middleware ***
-app.use('/slack/events', slackEvents.expressMiddleware());
-
-// *** Attach listeners to the event adapter ***
-
-// *** Greeting any user that says "hi" ***
-slackEvents.on('message', (message, body) => {
-  // Only deal with messages that have no subtype (plain messages) and contain 'hi'
-  if (!message.subtype && message.text.indexOf('hi') >= 0) {
-    // Initialize a client
-    const slack = getClientByTeamId(body.team_id);
-    // Handle initialization failure
-    if (!slack) {
-      return console.error('No authorization found for this team. Did you install this app again after restarting?');
+  async fetchInstallation(query) {
+    const installation = installations.get(installationKey(query));
+    if (!installation) {
+      throw new Error('No installation found for this workspace. Did you install the app again after restarting?');
     }
-    // Respond to the message back in the same channel
-    slack.chat.postMessage(message.channel, `Hello <@${message.user}>! :tada:`)
-      .catch(console.error);
+    return installation;
+  },
+  async deleteInstallation(query) {
+    installations.delete(installationKey(query));
+  },
+};
+
+// Org-wide installs are keyed by enterprise, everything else by team.
+// Note the two shapes: storing passes an Installation (nested `enterprise`/`team`
+// objects), while fetching and deleting pass an InstallationQuery (flat
+// `enterpriseId`/`teamId` strings). Read both or the key won't round-trip.
+function installationKey(source) {
+  const enterpriseId = source.enterpriseId || (source.enterprise && source.enterprise.id);
+  const teamId = source.teamId || (source.team && source.team.id);
+  if (source.isEnterpriseInstall && enterpriseId) {
+    return `enterprise:${enterpriseId}`;
   }
+  return `team:${teamId}`;
+}
+
+const successPage = fs.readFileSync(path.join(__dirname, 'views', 'auth.html'));
+
+// An unrecognized level leaves every log call silently disabled, so fall back
+// instead of passing it straight through.
+const requestedLogLevel = String(process.env.LOG_LEVEL || '').toLowerCase();
+const logLevel = Object.values(LogLevel).includes(requestedLogLevel) ? requestedLogLevel : LogLevel.INFO;
+
+// *** Initialize the app ***
+// signingSecret verifies that requests come from Slack; the OAuth settings
+// make Bolt serve /slack/install and /slack/oauth_redirect for "Add to Slack".
+const app = new App({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  clientId: process.env.SLACK_CLIENT_ID,
+  clientSecret: process.env.SLACK_CLIENT_SECRET,
+  stateSecret: process.env.SLACK_STATE_SECRET,
+  scopes: ['chat:write', 'channels:history', 'reactions:read'],
+  installationStore,
+  installerOptions: {
+    callbackOptions: {
+      success: (installation, options, req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(successPage);
+      },
+    },
+  },
+  customRoutes: [
+    {
+      path: '/',
+      method: ['GET'],
+      handler: (req, res) => {
+        res.writeHead(302, { Location: '/slack/install' });
+        res.end();
+      },
+    },
+  ],
+  extendedErrorHandler: true,
+  logLevel,
 });
 
-// *** Responding to reactions with the same emoji ***
-slackEvents.on('reaction_added', (event, body) => {
-  // Initialize a client
-  const slack = getClientByTeamId(body.team_id);
-  // Handle initialization failure
-  if (!slack) {
-    return console.error('No authorization found for this team. Did you install this app again after restarting?');
+// *** Greet any user that says "hi" ***
+app.message(/\bhi\b/i, async ({ message, say }) => {
+  // Bolt's message matcher filters on text alone, so subtypes such as
+  // bot_message and file_comment reach this listener with no `user` to greet.
+  if (!message.user) {
+    return;
   }
-  // Respond to the reaction back with the same emoji
-  slack.chat.postMessage(event.item.channel, `:${event.reaction}:`)
-    .catch(console.error);
+  // thread_ts keeps a greeting in the thread it was triggered from; it is
+  // undefined for channel-level messages, which posts to the channel.
+  await say({ text: `Hello <@${message.user}>! :tada:`, thread_ts: message.thread_ts });
+});
+
+// *** Respond to reactions with the same emoji ***
+app.event('reaction_added', async ({ event, client, context }) => {
+  if (event.item.type !== 'message') {
+    return;
+  }
+  // Bolt already drops reactions the bot itself adds. This drops reactions to
+  // the bot's own messages, which otherwise makes a busy channel very noisy.
+  if (event.item_user === context.botUserId) {
+    return;
+  }
+  // reaction_added carries no parent thread_ts, so the echo goes to the channel.
+  // Placing it in the thread would need a conversations.replies lookup.
+  await client.chat.postMessage({
+    channel: event.item.channel,
+    text: `:${event.reaction}:`,
+  });
 });
 
 // *** Handle errors ***
-slackEvents.on('error', (error) => {
-  if (error.code === slackEventsApi.errorCodes.TOKEN_VERIFICATION_FAILURE) {
-    // This error type also has a `body` propery containing the request body which failed verification.
-    console.error(`An unverified request was sent to the Slack events Request URL. Request body: \
-${JSON.stringify(error.body)}`);
-  } else {
-    console.error(`An error occurred while handling a Slack event: ${error.message}`);
-  }
+// Logging the error object rather than error.message keeps `code` and the
+// underlying Slack API response, which is what you need to diagnose failures
+// like not_in_channel. Listeners run after Bolt has already acked, so throwing
+// here would not make Slack retry.
+app.error(async ({ error, logger, body }) => {
+  logger.error('Failed to handle a Slack event', {
+    error,
+    eventType: body && body.event && body.event.type,
+  });
 });
 
-// Start the express application
-const port = process.env.PORT || 3000;
-http.createServer(app).listen(port, () => {
-  console.log(`server listening on port ${port}`);
-});
+// Start the app, unless another module (e.g. a test) imported it
+if (require.main === module) {
+  const port = Number(process.env.PORT) || 3000;
+  app.start(port)
+    .then(() => {
+      console.log(`⚡️ Greet and React is listening on port ${port}`);
+    })
+    .catch((error) => {
+      console.error(`Failed to start on port ${port}: ${error.message}`);
+      process.exit(1);
+    });
+}
+
+module.exports = { app, installationStore };
